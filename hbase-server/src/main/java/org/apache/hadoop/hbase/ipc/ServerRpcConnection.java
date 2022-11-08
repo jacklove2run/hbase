@@ -29,6 +29,8 @@ import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
 import java.nio.channels.ReadableByteChannel;
 import java.security.GeneralSecurityException;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.Properties;
 
 import org.apache.commons.crypto.cipher.CryptoCipherFactory;
@@ -77,6 +79,8 @@ import org.apache.hadoop.security.authorize.AuthorizationException;
 import org.apache.hadoop.security.authorize.ProxyUsers;
 import org.apache.hadoop.security.token.SecretManager.InvalidToken;
 import org.apache.hadoop.security.token.TokenIdentifier;
+import org.apache.hadoop.hbase.util.Hex;
+
 
 /** Reads calls from a connection and queues them for handling. */
 @edu.umd.cs.findbugs.annotations.SuppressWarnings(
@@ -88,6 +92,9 @@ abstract class ServerRpcConnection implements Closeable {
   protected final RpcServer rpcServer;
   // If the connection header has been read or not.
   protected boolean connectionHeaderRead = false;
+
+  public static final String HBASE_SECURITY_BASIC_AUTH_KEY = "hbase.security.basic.auth";
+  public static final String HBASE_SECURITY_BASIC_WHITELIST_KEY = "hbase.security.basic.whitelist";
 
   protected CallCleanup callCleanup;
 
@@ -127,6 +134,10 @@ abstract class ServerRpcConnection implements Closeable {
 
   protected User user = null;
   protected UserGroupInformation ugi = null;
+  protected String basicToken = "";
+  protected long basicTimestamp = 0;
+  protected boolean basicAuth = false;
+  protected String basicPassword = "test";
 
   public ServerRpcConnection(RpcServer rpcServer) {
     this.rpcServer = rpcServer;
@@ -285,14 +296,25 @@ abstract class ServerRpcConnection implements Closeable {
 
   private UserGroupInformation createUser(ConnectionHeader head) {
     UserGroupInformation ugi = null;
-
     if (!head.hasUserInfo()) {
       return null;
     }
+    this.basicAuth = Boolean.parseBoolean(this.rpcServer.conf.get(HBASE_SECURITY_BASIC_AUTH_KEY));
     UserInformation userInfoProto = head.getUserInfo();
     String effectiveUser = null;
     if (userInfoProto.hasEffectiveUser()) {
       effectiveUser = userInfoProto.getEffectiveUser();
+    }
+
+    // If basic auth is enable, the format of username would be like:
+    // "$username|$token|$timestamp", separated by '|'
+    if (this.basicAuth && !effectiveUser.isEmpty()) {
+      String[] userAuthSplit = effectiveUser.split("\\|");
+      if (userAuthSplit.length >= 3) {
+        effectiveUser = userAuthSplit[0];
+        this.basicToken = userAuthSplit[1];
+        this.basicTimestamp = Long.parseLong(userAuthSplit[2]);
+      }
     }
     String realUser = null;
     if (userInfoProto.hasRealUser()) {
@@ -466,6 +488,45 @@ abstract class ServerRpcConnection implements Closeable {
     }
   }
 
+  private boolean basicAuthorizer() {
+    if (basicToken.isEmpty() || basicTimestamp == 0) {
+      return false;
+    }
+
+    //The validity of token is 60 seconds
+    if (System.currentTimeMillis() - basicTimestamp > 60 * 10 * 1000) {
+      return false;
+    }
+
+    try {
+      if (!Hex.encodeHexString(this.toSHA1(Bytes.add(Bytes.toBytes(basicPassword),
+              Bytes.toBytes(basicTimestamp)))).substring(0, 10).equals(basicToken)) {
+        return false;
+      }
+      return true;
+    } catch (NoSuchAlgorithmException e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  private static byte[] toSHA1(byte[] key) throws NoSuchAlgorithmException {
+    MessageDigest md = MessageDigest.getInstance("SHA-1");
+    return md.digest(key);
+  }
+
+  private boolean isInBasicAuthWhiteList() {
+    String whiteStr = this.rpcServer.conf.get(HBASE_SECURITY_BASIC_WHITELIST_KEY);
+    if (whiteStr.isEmpty()) {
+      return false;
+    }
+    for (String white: whiteStr.split(",")) {
+      if (white.equals(ugi.getUserName())) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private boolean authorizeConnection() throws IOException {
     try {
       // If auth method is DIGEST, the token was obtained by the
@@ -475,6 +536,9 @@ abstract class ServerRpcConnection implements Closeable {
       if (ugi != null && ugi.getRealUser() != null
           && (authMethod != AuthMethod.DIGEST)) {
         ProxyUsers.authorize(ugi, this.getHostAddress(), this.rpcServer.conf);
+      }
+      if (basicAuth && !this.isInBasicAuthWhiteList() && !this.basicAuthorizer()) {
+        throw new AuthorizationException("Invalid username or password!");
       }
       this.rpcServer.authorize(ugi, connectionHeader, getHostInetAddress());
       this.rpcServer.metrics.authorizationSuccess();
