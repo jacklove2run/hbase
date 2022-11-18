@@ -79,6 +79,11 @@ message UserInformation {
   optional string real_user = 2;
 }
 
+message AuthenticationPassport {
+  required string token = 1;
+  required uint32 timestamp = 2;
+}
+
 // This is sent on connection setup after the connection preamble is sent.
 message ConnectionHeader {
   optional UserInformation user_info = 1;
@@ -92,6 +97,7 @@ message ConnectionHeader {
   optional VersionInfo version_info = 5;
   // the transformation for rpc AES encryption with Apache Commons Crypto
   optional string rpc_crypto_cipher_transformation = 6;
+  optional AuthenticationPassport authentication_passport = 7;
 }
 
 // This is sent by rpc server to negotiate the data if necessary

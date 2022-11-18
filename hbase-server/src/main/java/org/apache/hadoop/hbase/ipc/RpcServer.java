@@ -101,6 +101,12 @@ public abstract class RpcServer implements RpcServerInterface,
   public static final String FALLBACK_TO_INSECURE_CLIENT_AUTH =
           "hbase.ipc.server.fallback-to-simple-auth-allowed";
 
+  public static final String HBASE_SECURITY_BASIC_AUTH_KEY = "hbase.security.basic.auth";
+
+  public static final String HBASE_SECURITY_BASIC_WHITELIST_KEY = "hbase.security.basic.whitelist";
+
+  public static final String HBASE_SECURITY_BASIC_USER_PASSWORD_KEY = "hbase.security.basic.user.password";
+
   /**
    * How many calls/handler are allowed in the queue.
    */
@@ -218,6 +224,12 @@ public abstract class RpcServer implements RpcServerInterface,
 
   protected volatile boolean allowFallbackToSimpleAuth;
 
+  protected volatile boolean basicAuthenticationEnable;
+
+  protected volatile HashMap<String, Boolean> basicAuthenticationWhiteList;
+
+  protected volatile HashMap<String, String> basicAuthenticationUserPassword;
+
   /**
    * Used to get details for scan with a scanner_id<br/>
    * TODO try to figure out a better way and remove reference from regionserver package later.
@@ -333,8 +345,56 @@ public abstract class RpcServer implements RpcServerInterface,
   @Override
   public void onConfigurationChange(Configuration newConf) {
     initReconfigurable(newConf);
+    updateBasicAuthConfig(newConf);
     if (scheduler instanceof ConfigurationObserver) {
       ((ConfigurationObserver) scheduler).onConfigurationChange(newConf);
+    }
+  }
+
+  protected void updateBasicAuthConfig(Configuration confToLoad) {
+    this.basicAuthenticationEnable = confToLoad.getBoolean(HBASE_SECURITY_BASIC_AUTH_KEY, false);
+    String whiteStr = confToLoad.get(HBASE_SECURITY_BASIC_WHITELIST_KEY, "");
+    String userPasswordStr = confToLoad.get(HBASE_SECURITY_BASIC_USER_PASSWORD_KEY , "");
+    if (this.basicAuthenticationWhiteList == null) {
+      this.basicAuthenticationWhiteList = new HashMap<String, Boolean>();
+    }
+    if (this.basicAuthenticationUserPassword == null) {
+      this.basicAuthenticationUserPassword = new HashMap<String, String>();
+    }
+
+    //TODO: need some optimization for clear() operation
+    this.basicAuthenticationWhiteList.clear();
+    this.basicAuthenticationUserPassword.clear();
+
+    /*
+     * The configuration of the white list is like this:
+     * <property>
+     *   <name>hbase.security.basic.whitelist</name>
+     *   <value>user1|pwd1,user2|pwd2</value>
+     * </property>
+     */
+    for (String white: whiteStr.split(",")) {
+      if (white.split("@").length != 2) {
+        LOG.warn("Invalid format of whitelist info");
+        continue;
+      }
+      this.basicAuthenticationWhiteList.put(white, true);
+    }
+
+    /*
+     * The configuration of userinfo is like this:
+     *   <property>
+     *     <name>hbase.security.basic.user.password</name>
+     *     <value>user1|pwd1,user2|pwd2</value>
+     *   </property>
+     */
+    for (String user: userPasswordStr.split(",")) {
+      String[]info = user.split("|");
+      if (info.length != 2) {
+        LOG.warn("Invalid format of user password info");
+        continue;
+      }
+      this.basicAuthenticationUserPassword.put(info[0], info[1]);
     }
   }
 

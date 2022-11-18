@@ -47,6 +47,13 @@ import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFacto
 public class UserProvider extends BaseConfigurable {
 
   private static final String USER_PROVIDER_CONF_KEY = "hbase.client.userprovider.class";
+
+  private static final String HBASE_SECURITY_AUTHENTICATION_KEY = "hbase.security.authentication";
+  private static final String HBASE_SECURITY_BASIC_AUTH_KEY = "hbase.security.basic.auth";
+
+  private static final String HBASE_CLIENT_USERNAME_KEY = "hbase.client.username";
+
+  private static final String HBASE_CLIENT_PASSWORD_KEY = "hbase.client.password";
   private static final ListeningExecutorService executor = MoreExecutors.listeningDecorator(
       Executors.newScheduledThreadPool(
           1,
@@ -166,6 +173,24 @@ public class UserProvider extends BaseConfigurable {
    */
   public User getCurrent() throws IOException {
     return User.getCurrent();
+  }
+
+  public User getCurrent(Configuration conf) throws IOException {
+    if (!conf.getBoolean(HBASE_SECURITY_BASIC_AUTH_KEY, false)
+            || !conf.get(HBASE_SECURITY_AUTHENTICATION_KEY, "").equals("simple")
+            || conf.get(HBASE_CLIENT_USERNAME_KEY, "").isEmpty()
+            || conf.get(HBASE_CLIENT_PASSWORD_KEY, "").isEmpty()) {
+      return User.getCurrent();
+    }
+    return User.getCurrentByName(conf.get(HBASE_CLIENT_USERNAME_KEY));
+  }
+
+  /**
+   * @return the current user with the username
+   * @throws IOException if the user cannot be loaded
+   */
+  public User getCurrentByName(String username) throws IOException {
+    return User.getCurrentByName(username);
   }
 
   /**
