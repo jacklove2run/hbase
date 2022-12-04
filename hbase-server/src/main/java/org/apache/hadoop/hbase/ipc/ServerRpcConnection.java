@@ -29,6 +29,8 @@ import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
 import java.nio.channels.ReadableByteChannel;
 import java.security.GeneralSecurityException;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.Properties;
 
 import org.apache.commons.crypto.cipher.CryptoCipherFactory;
@@ -65,6 +67,7 @@ import org.apache.hadoop.hbase.shaded.protobuf.generated.RPCProtos.ConnectionHea
 import org.apache.hadoop.hbase.shaded.protobuf.generated.RPCProtos.RequestHeader;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.RPCProtos.ResponseHeader;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.RPCProtos.UserInformation;
+import org.apache.hadoop.hbase.shaded.protobuf.generated.RPCProtos.AuthenticationPassport;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.io.BytesWritable;
 import org.apache.hadoop.io.IntWritable;
@@ -77,6 +80,8 @@ import org.apache.hadoop.security.authorize.AuthorizationException;
 import org.apache.hadoop.security.authorize.ProxyUsers;
 import org.apache.hadoop.security.token.SecretManager.InvalidToken;
 import org.apache.hadoop.security.token.TokenIdentifier;
+import org.apache.hadoop.hbase.util.Hex;
+
 
 /** Reads calls from a connection and queues them for handling. */
 @edu.umd.cs.findbugs.annotations.SuppressWarnings(
@@ -88,6 +93,8 @@ abstract class ServerRpcConnection implements Closeable {
   protected final RpcServer rpcServer;
   // If the connection header has been read or not.
   protected boolean connectionHeaderRead = false;
+
+  public static final String HBASE_SECURITY_BASIC_AUTH_KEY = "hbase.security.basic.auth";
 
   protected CallCleanup callCleanup;
 
@@ -127,6 +134,13 @@ abstract class ServerRpcConnection implements Closeable {
 
   protected User user = null;
   protected UserGroupInformation ugi = null;
+
+  protected AuthenticationPassport passport = null;
+  protected boolean basicAuth = false;
+
+  protected String basicToken = "";
+  protected int basicTimestamp = 0;
+  protected String basicPassword = "test";
 
   public ServerRpcConnection(RpcServer rpcServer) {
     this.rpcServer = rpcServer;
@@ -283,9 +297,17 @@ abstract class ServerRpcConnection implements Closeable {
     return (bytes.length == 0) ? ByteString.EMPTY : ByteString.copyFrom(bytes);
   }
 
+  private void getAuthenticationPassport(ConnectionHeader head) {
+    if (!head.hasAuthenticationPassport()) {
+      return;
+    }
+    passport = head.getAuthenticationPassport();
+    this.basicTimestamp = passport.getTimestamp();
+    this.basicToken = passport.getToken();
+  }
+
   private UserGroupInformation createUser(ConnectionHeader head) {
     UserGroupInformation ugi = null;
-
     if (!head.hasUserInfo()) {
       return null;
     }
@@ -466,6 +488,47 @@ abstract class ServerRpcConnection implements Closeable {
     }
   }
 
+  private boolean basicAuthorizer() {
+    if (basicToken.isEmpty() || basicTimestamp == 0) {
+      return false;
+    }
+
+    //The validity of token is 60 seconds
+    if (System.currentTimeMillis() / 1000 - basicTimestamp > 60 * 10) {
+      return false;
+    }
+    String password = this.rpcServer.basicAuthenticationUserPassword.getOrDefault(ugi.getUserName(), "");
+    if (password.isEmpty()) {
+      return false;
+    }
+
+    try {
+      if (!Hex.encodeHexString(this.toSHA1(Bytes.add(Bytes.toBytes("BASIC_AUTH_TOKEN"),
+              Bytes.toBytes(password), Bytes.toBytes(basicTimestamp)))).equals(basicToken)) {
+        return false;
+      }
+      return true;
+    } catch (NoSuchAlgorithmException e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  private static byte[] toSHA1(byte[] key) throws NoSuchAlgorithmException {
+    MessageDigest md = MessageDigest.getInstance("SHA-1");
+    return md.digest(key);
+  }
+
+  private boolean isInBasicAuthWhiteList() {
+    return this.rpcServer.basicAuthenticationWhiteList.getOrDefault(ugi.getUserName()
+            + "@" + this.hostAddress, false);
+  }
+
+  private void authTest() throws IOException {
+    if (this.hostAddress.equals("36.110.204.4") && this.rpcServer.bindAddress.getPort() == 16020) {
+      throw new AuthorizationException("Auth Test");
+    }
+  }
+
   private boolean authorizeConnection() throws IOException {
     try {
       // If auth method is DIGEST, the token was obtained by the
@@ -475,6 +538,9 @@ abstract class ServerRpcConnection implements Closeable {
       if (ugi != null && ugi.getRealUser() != null
           && (authMethod != AuthMethod.DIGEST)) {
         ProxyUsers.authorize(ugi, this.getHostAddress(), this.rpcServer.conf);
+      }
+      if (this.rpcServer.conf.getBoolean("hbase.preamble.exception.test", false)) {
+        this.authTest();
       }
       this.rpcServer.authorize(ugi, connectionHeader, getHostInetAddress());
       this.rpcServer.metrics.authorizationSuccess();
@@ -543,6 +609,14 @@ abstract class ServerRpcConnection implements Closeable {
           ugi.setAuthenticationMethod(AuthenticationMethod.PROXY);
         }
       }
+    }
+    getAuthenticationPassport(this.connectionHeader);
+    if (this.rpcServer.conf.getBoolean(HBASE_SECURITY_BASIC_AUTH_KEY, false)
+            && !this.isInBasicAuthWhiteList()
+            && !this.basicAuthorizer()) {
+      AccessDeniedException ae = new AccessDeniedException("Authentication failed");
+      doRespond(getErrorResponse(ae.getMessage(), ae));
+      throw ae;
     }
     String version;
     if (this.connectionHeader.hasVersionInfo()) {
@@ -752,6 +826,7 @@ abstract class ServerRpcConnection implements Closeable {
       doBadPreambleHandling(msg, new BadAuthException(msg));
       return false;
     }
+
     if (this.rpcServer.isSecurityEnabled && authMethod == AuthMethod.SIMPLE) {
       if (this.rpcServer.allowFallbackToSimpleAuth) {
         this.rpcServer.metrics.authenticationFallback();

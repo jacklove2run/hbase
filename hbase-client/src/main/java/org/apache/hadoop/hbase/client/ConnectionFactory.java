@@ -201,7 +201,7 @@ public class ConnectionFactory {
       throws IOException {
     if (user == null) {
       UserProvider provider = UserProvider.instantiate(conf);
-      user = provider.getCurrent();
+      user = provider.getCurrent(conf);
     }
 
     String className = conf.get(ClusterConnection.HBASE_CLIENT_CONNECTION_IMPL,

@@ -17,12 +17,15 @@
  */
 package org.apache.hadoop.hbase.ipc;
 
+import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hbase.thirdparty.io.netty.util.HashedWheelTimer;
 import org.apache.hbase.thirdparty.io.netty.util.Timeout;
 import org.apache.hbase.thirdparty.io.netty.util.TimerTask;
 
 import java.io.IOException;
 import java.net.UnknownHostException;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.concurrent.TimeUnit;
 
 import org.apache.hadoop.conf.Configuration;
@@ -35,6 +38,7 @@ import org.apache.hadoop.hbase.protobuf.generated.AuthenticationProtos;
 import org.apache.hadoop.hbase.shaded.protobuf.ProtobufUtil;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.RPCProtos.ConnectionHeader;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.RPCProtos.UserInformation;
+import org.apache.hadoop.hbase.shaded.protobuf.generated.RPCProtos.AuthenticationPassport;
 import org.apache.hadoop.hbase.security.AuthMethod;
 import org.apache.hadoop.hbase.security.SecurityInfo;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
@@ -45,6 +49,7 @@ import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.security.token.Token;
 import org.apache.hadoop.security.token.TokenIdentifier;
 import org.apache.hadoop.security.token.TokenSelector;
+import org.apache.hadoop.hbase.util.Hex;
 
 /**
  * Base class for ipc connection.
@@ -75,6 +80,12 @@ abstract class RpcConnection {
   protected final Configuration conf;
 
   protected static String CRYPTO_AES_ENABLED_KEY = "hbase.rpc.crypto.encryption.aes.enabled";
+
+  private static final String HBASE_SECURITY_BASIC_AUTH_KEY = "hbase.security.basic.auth";
+
+  private static final String HBASE_CLIENT_USERNAME_KEY = "hbase.client.username";
+
+  private static final String HBASE_CLIENT_PASSWORD_KEY = "hbase.client.password";
 
   protected static boolean CRYPTO_AES_ENABLED_DEFAULT = false;
 
@@ -139,6 +150,31 @@ abstract class RpcConnection {
     }
     reloginMaxBackoff = conf.getInt("hbase.security.relogin.maxbackoff", 5000);
     this.remoteId = remoteId;
+  }
+
+  private byte[] toSHA1(byte[] key) throws NoSuchAlgorithmException {
+    MessageDigest md = MessageDigest.getInstance("SHA-1");
+    return md.digest(key);
+  }
+
+  private AuthenticationPassport getAuthenticationPassport() {
+    if (authMethod != AuthMethod.SIMPLE
+            || !conf.getBoolean(HBASE_SECURITY_BASIC_AUTH_KEY, false)
+            || conf.get(HBASE_CLIENT_USERNAME_KEY, "").isEmpty()
+            || conf.get(HBASE_CLIENT_PASSWORD_KEY, "").isEmpty()) {
+      return null;
+    }
+    AuthenticationPassport.Builder passport = AuthenticationPassport.newBuilder();
+    int timestamp = (int) (System.currentTimeMillis() / 1000);
+    passport.setTimestamp(timestamp);
+    try {
+      String token = Hex.encodeHexString(this.toSHA1(Bytes.add(Bytes.toBytes("BASIC_AUTH_TOKEN"),
+              Bytes.toBytes(conf.get(HBASE_CLIENT_PASSWORD_KEY, "")), Bytes.toBytes(timestamp))));
+      passport.setToken(token);
+    } catch (NoSuchAlgorithmException e) {
+      throw new RuntimeException(e);
+    }
+    return passport.build();
   }
 
   private UserInformation getUserInfo(UserGroupInformation ugi) {
@@ -225,8 +261,13 @@ abstract class RpcConnection {
     ConnectionHeader.Builder builder = ConnectionHeader.newBuilder();
     builder.setServiceName(remoteId.getServiceName());
     UserInformation userInfoPB;
+    AuthenticationPassport passport;
+
     if ((userInfoPB = getUserInfo(remoteId.ticket.getUGI())) != null) {
       builder.setUserInfo(userInfoPB);
+    }
+    if ((passport = getAuthenticationPassport()) != null) {
+      builder.setAuthenticationPassport(passport);
     }
     if (this.codec != null) {
       builder.setCellBlockCodecClass(this.codec.getClass().getCanonicalName());

@@ -58,6 +58,10 @@ public abstract class User {
   public static final String HBASE_SECURITY_AUTHORIZATION_CONF_KEY =
       "hbase.security.authorization";
 
+  public static final String HBASE_CLIENT_USERNAME_KEY = "hbase.client.username";
+
+  public static final String HBASE_CLIENT_PASSWORD_KEY = "hbase.client.password";
+
   protected UserGroupInformation ugi;
 
   public UserGroupInformation getUGI() {
@@ -169,6 +173,17 @@ public abstract class User {
   }
 
   /**
+   * Returns the {@code User} instance with current username in configuration.
+   */
+  public static User getCurrentByName(String username) throws IOException {
+    User user = new SecureHadoopUser(username);
+    if (user.getUGI() == null) {
+      return null;
+    }
+    return user;
+  }
+
+  /**
    * Executes the given action as the login user
    * @param action
    * @return the result of the action
@@ -261,6 +276,11 @@ public abstract class User {
    public static final class SecureHadoopUser extends User {
     private String shortName;
     private LoadingCache<String, String[]> cache;
+
+    public SecureHadoopUser(String user) throws IOException {
+      ugi = UserGroupInformation.createRemoteUser(user);
+      this.cache = null;
+    }
 
     public SecureHadoopUser() throws IOException {
       ugi = UserGroupInformation.getCurrentUser();
